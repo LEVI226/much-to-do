@@ -1,4 +1,4 @@
-name: Deploy Backend → EC2 Rolling Update
+name: Deploy Backend → GCE Rolling Update
 
 on:
   push:
@@ -26,22 +26,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: google-github-actions/auth@v2
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
 
       - name: Deploy → Instance 1
         run: |
-          CMD=$(aws ssm send-command             --instance-ids "${{ secrets.EC2_HOST_1 }}"             --document-name "AWS-RunShellScript"             --parameters 'commands=["cd /opt/muchtodo/repo && git fetch origin main && git reset --hard origin/main && cd Server/MuchToDo && GOPATH=/opt/muchtodo/go go build -o /opt/muchtodo/server ./cmd/api/ && systemctl restart muchtodo"]'             --timeout-seconds 300 --query "Command.CommandId" --output text)
-          aws ssm wait command-executed --command-id "$CMD" --instance-id "${{ secrets.EC2_HOST_1 }}"
+          gcloud compute ssh ${{ secrets.GCE_INSTANCE_1 }}             --zone=${{ secrets.GCE_ZONE_1 }}             --project=${{ secrets.GCP_PROJECT_ID }}             --tunnel-through-iap             --quiet             --command="
+              set -e
+              cd /opt/much-to-do/repo
+              git fetch origin main
+              git reset --hard origin/main
+              cd Server/MuchToDo
+              HOME=/root go build -o /opt/much-to-do/server ./cmd/api/
+              sudo systemctl restart much-to-do
+              sleep 5
+              systemctl is-active much-to-do
+            "
 
       - name: Health check
-        run: sleep 15 && curl -sf "http://${{ secrets.ALB_DNS_NAME }}/ping" || true
+        run: sleep 15 && curl -sf "http://${{ secrets.LB_IP }}/health" || true
 
       - name: Deploy → Instance 2
         run: |
-          CMD=$(aws ssm send-command             --instance-ids "${{ secrets.EC2_HOST_2 }}"             --document-name "AWS-RunShellScript"             --parameters 'commands=["cd /opt/muchtodo/repo && git fetch origin main && git reset --hard origin/main && cd Server/MuchToDo && GOPATH=/opt/muchtodo/go go build -o /opt/muchtodo/server ./cmd/api/ && systemctl restart muchtodo"]'             --timeout-seconds 300 --query "Command.CommandId" --output text)
-          aws ssm wait command-executed --command-id "$CMD" --instance-id "${{ secrets.EC2_HOST_2 }}"
+          gcloud compute ssh ${{ secrets.GCE_INSTANCE_2 }}             --zone=${{ secrets.GCE_ZONE_2 }}             --project=${{ secrets.GCP_PROJECT_ID }}             --tunnel-through-iap             --quiet             --command="
+              set -e
+              cd /opt/much-to-do/repo
+              git fetch origin main
+              git reset --hard origin/main
+              cd Server/MuchToDo
+              HOME=/root go build -o /opt/much-to-do/server ./cmd/api/
+              sudo systemctl restart much-to-do
+            "
           echo "✅ Rolling deployment complete!"

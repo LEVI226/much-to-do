@@ -1,4 +1,4 @@
-name: Deploy Frontend → S3 + CloudFront
+name: Deploy Frontend → GCS + Cloud CDN
 
 on:
   push:
@@ -10,7 +10,7 @@ on:
 
 jobs:
   deploy:
-    name: Build React SPA and deploy to S3
+    name: Build React SPA and deploy to GCS
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -28,23 +28,23 @@ jobs:
       - name: Build SPA
         working-directory: Client
         env:
-          VITE_API_BASE_URL: http://${{ secrets.ALB_DNS_NAME }}
+          VITE_API_BASE_URL: http://${{ secrets.LB_IP }}
         run: npm run build
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: google-github-actions/auth@v2
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Sync to S3
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Sync build artifacts to GCS
         working-directory: Client
         run: |
-          aws s3 sync dist/ s3://${{ secrets.S3_FRONTEND_BUCKET }}             --delete             --cache-control "public,max-age=31536000,immutable"             --exclude "index.html"
-          aws s3 cp dist/index.html s3://${{ secrets.S3_FRONTEND_BUCKET }}/index.html             --cache-control "no-cache,no-store,must-revalidate"
+          gsutil -m rsync -r -d -x "^index.html$"             dist/ gs://${{ secrets.GCS_FRONTEND_BUCKET }}/
+          gsutil -m setmeta             -h "Cache-Control:public,max-age=31536000,immutable"             "gs://${{ secrets.GCS_FRONTEND_BUCKET }}/**" 2>/dev/null || true
+          gsutil cp             -h "Cache-Control:no-cache,no-store,must-revalidate"             -h "Content-Type:text/html"             dist/index.html             gs://${{ secrets.GCS_FRONTEND_BUCKET }}/index.html
 
-      - name: Invalidate CloudFront
+      - name: Invalidate Cloud CDN cache
         run: |
-          ID=$(aws cloudfront create-invalidation             --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}             --paths "/*" --query Invalidation.Id --output text)
-          aws cloudfront wait invalidation-completed             --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} --id "$ID"
+          gcloud compute url-maps invalidate-cdn-cache             ${{ secrets.CDN_URL_MAP_NAME }}             --path "/*"             --project ${{ secrets.GCP_PROJECT_ID }}             --async
           echo "✅ Frontend deployed!"

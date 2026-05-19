@@ -1,4 +1,4 @@
-name: Deploy Backend → GCE Rolling Update
+name: Deploy Backend → GCE MIG Rolling Update
 
 on:
   push:
@@ -8,56 +8,87 @@ on:
       - '.github/workflows/deploy-backend.yml'
   workflow_dispatch:
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   test:
+    name: Run Go tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: Server/MuchToDo/go.mod
           cache-dependency-path: Server/MuchToDo/go.sum
-      - run: go test ./... -v -short
+      - name: Run unit tests
         working-directory: Server/MuchToDo
+        run: go test ./... -v -short
 
   deploy:
+    name: Rolling deploy to MIG via IAP
     runs-on: ubuntu-latest
     needs: test
+
     steps:
       - uses: actions/checkout@v4
 
-      - uses: google-github-actions/auth@v2
+      - name: Authenticate to GCP via WIF
+        uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.DEPLOYER_SA_EMAIL }}
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
 
-      - name: Deploy → Instance 1
+      - name: Install IAP tunnel component
+        run: gcloud components install beta --quiet
+
+      - name: Rolling deploy to MIG instances
         run: |
-          gcloud compute ssh ${{ secrets.GCE_INSTANCE_1 }}             --zone=${{ secrets.GCE_ZONE_1 }}             --project=${{ secrets.GCP_PROJECT_ID }}             --tunnel-through-iap             --quiet             --command="
-              set -e
-              cd /opt/much-to-do/repo
-              git fetch origin main
-              git reset --hard origin/main
-              cd Server/MuchToDo
-              HOME=/root go build -o /opt/much-to-do/server ./cmd/api/
-              sudo systemctl restart much-to-do
-              sleep 5
-              systemctl is-active much-to-do
-            "
+          PROJECT="${{ secrets.GCP_PROJECT_ID }}"
+          REGION="${{ secrets.GCP_REGION }}"
+          MIG="${{ secrets.MIG_NAME }}"
 
-      - name: Health check
-        run: sleep 15 && curl -sf "http://${{ secrets.LB_IP }}/health" || true
+          echo "=== Fetching MIG instances ==="
+          INSTANCES=$(gcloud compute instance-groups managed list-instances "$MIG" \
+            --region="$REGION" \
+            --project="$PROJECT" \
+            --format="csv[no-heading](instance,zone)")
 
-      - name: Deploy → Instance 2
-        run: |
-          gcloud compute ssh ${{ secrets.GCE_INSTANCE_2 }}             --zone=${{ secrets.GCE_ZONE_2 }}             --project=${{ secrets.GCP_PROJECT_ID }}             --tunnel-through-iap             --quiet             --command="
-              set -e
-              cd /opt/much-to-do/repo
-              git fetch origin main
-              git reset --hard origin/main
-              cd Server/MuchToDo
-              HOME=/root go build -o /opt/much-to-do/server ./cmd/api/
-              sudo systemctl restart much-to-do
-            "
-          echo "✅ Rolling deployment complete!"
+          if [ -z "$INSTANCES" ]; then
+            echo "ERROR: No instances found in MIG $MIG"
+            exit 1
+          fi
+
+          DEPLOY_CMD='set -e
+          cd /opt/much-to-do/repo
+          git fetch origin main
+          git reset --hard origin/main
+          cd Server/MuchToDo
+          HOME=/root go build -o /opt/much-to-do/server ./cmd/api/
+          sudo chown muchtodo:muchtodo /opt/much-to-do/server
+          sudo systemctl restart much-to-do
+          sleep 5
+          systemctl is-active much-to-do && echo DEPLOY_OK || { echo DEPLOY_FAILED; exit 1; }'
+
+          while IFS=',' read -r INSTANCE_URL ZONE; do
+            INSTANCE=$(basename "$INSTANCE_URL")
+            echo "--- Deploying to $INSTANCE ($ZONE) ---"
+            gcloud compute ssh "$INSTANCE" \
+              --zone="$ZONE" \
+              --project="$PROJECT" \
+              --tunnel-through-iap \
+              --quiet \
+              --command="$DEPLOY_CMD"
+
+            echo "--- Waiting for LB health check ---"
+            sleep 15
+            HTTP=$(curl -sk -o /dev/null -w "%{http_code}" "${{ secrets.VITE_API_BASE_URL }}/health" || echo "000")
+            echo "LB health check: HTTP $HTTP"
+            echo "--- $INSTANCE deployed ---"
+          done <<< "$INSTANCES"
+
+          echo "Rolling deploy complete!"

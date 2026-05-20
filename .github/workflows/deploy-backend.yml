@@ -30,7 +30,6 @@ jobs:
     name: Rolling deploy to MIG via IAP
     runs-on: ubuntu-latest
     needs: test
-
     steps:
       - uses: actions/checkout@v4
 
@@ -49,14 +48,14 @@ jobs:
           REGION="${{ secrets.GCP_REGION }}"
           MIG="${{ secrets.MIG_NAME }}"
 
-          echo "=== Triggering rolling instance refresh on $MIG ==="
+          echo "=== Triggering rolling replace on $MIG ==="
           gcloud compute instance-groups managed rolling-action replace "$MIG" \
             --region="$REGION" \
             --project="$PROJECT" \
             --max-surge=2 \
             --max-unavailable=0
 
-          echo "=== Waiting for rolling update to complete (up to 5 min) ==="
+          echo "=== Waiting for update to complete ==="
           gcloud compute instance-groups managed wait-until "$MIG" \
             --version-target-reached \
             --region="$REGION" \
@@ -66,20 +65,8 @@ jobs:
           echo "=== Waiting 30s for app startup ==="
           sleep 30
 
-          echo "=== Checking backend health via Load Balancer ==="
+          echo "=== Health check ==="
           HTTP=$(curl -sk -o /dev/null -w "%{http_code}" \
             "${{ secrets.VITE_API_BASE_URL }}/health" || echo "000")
-          echo "Health check HTTP status: $HTTP"
-
-          if [ "$HTTP" = "200" ]; then
-            echo "Deploy successful — backend is healthy"
-          else
-            echo "Health check returned $HTTP — waiting 30s more..."
-            sleep 30
-            HTTP2=$(curl -sk -o /dev/null -w "%{http_code}" \
-              "${{ secrets.VITE_API_BASE_URL }}/health" || echo "000")
-            [ "$HTTP2" = "200" ] && echo "Deploy successful on retry" || \
-              { echo "Health check failed"; exit 1; }
-          fi
-
-          echo "Rolling deploy complete!"
+          echo "HTTP $HTTP"
+          [ "$HTTP" = "200" ] && echo "Deploy successful" || { echo "Health check failed: $HTTP"; exit 1; }

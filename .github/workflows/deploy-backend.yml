@@ -37,58 +37,49 @@ jobs:
       - name: Authenticate to GCP via WIF
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
-          service_account: ${{ secrets.DEPLOYER_SA_EMAIL }}
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
       - name: Set up gcloud CLI
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Install IAP tunnel component
-        run: gcloud components install beta --quiet
-
-      - name: Rolling deploy to MIG instances
+      - name: Trigger MIG rolling instance refresh
         run: |
           PROJECT="${{ secrets.GCP_PROJECT_ID }}"
           REGION="${{ secrets.GCP_REGION }}"
           MIG="${{ secrets.MIG_NAME }}"
 
-          echo "=== Fetching MIG instances ==="
-          INSTANCES=$(gcloud compute instance-groups managed list-instances "$MIG" \
+          echo "=== Triggering rolling instance refresh on $MIG ==="
+          gcloud compute instance-groups managed rolling-action replace "$MIG" \
             --region="$REGION" \
             --project="$PROJECT" \
-            --format="csv[no-heading](instance,zone)")
+            --max-surge=2 \
+            --max-unavailable=0
 
-          if [ -z "$INSTANCES" ]; then
-            echo "ERROR: No instances found in MIG $MIG"
-            exit 1
+          echo "=== Waiting for rolling update to complete (up to 5 min) ==="
+          gcloud compute instance-groups managed wait-until "$MIG" \
+            --version-target-reached \
+            --region="$REGION" \
+            --project="$PROJECT" \
+            --timeout=300
+
+          echo "=== Waiting 30s for app startup ==="
+          sleep 30
+
+          echo "=== Checking backend health via Load Balancer ==="
+          HTTP=$(curl -sk -o /dev/null -w "%{http_code}" \
+            "${{ secrets.VITE_API_BASE_URL }}/health" || echo "000")
+          echo "Health check HTTP status: $HTTP"
+
+          if [ "$HTTP" = "200" ]; then
+            echo "Deploy successful — backend is healthy"
+          else
+            echo "Health check returned $HTTP — waiting 30s more..."
+            sleep 30
+            HTTP2=$(curl -sk -o /dev/null -w "%{http_code}" \
+              "${{ secrets.VITE_API_BASE_URL }}/health" || echo "000")
+            [ "$HTTP2" = "200" ] && echo "Deploy successful on retry" || \
+              { echo "Health check failed"; exit 1; }
           fi
-
-          DEPLOY_CMD='set -e
-          cd /opt/much-to-do/repo
-          git fetch origin main
-          git reset --hard origin/main
-          cd Server/MuchToDo
-          HOME=/root go build -o /opt/much-to-do/server ./cmd/api/
-          sudo chown muchtodo:muchtodo /opt/much-to-do/server
-          sudo systemctl restart much-to-do
-          sleep 5
-          systemctl is-active much-to-do && echo DEPLOY_OK || { echo DEPLOY_FAILED; exit 1; }'
-
-          while IFS=',' read -r INSTANCE_URL ZONE; do
-            INSTANCE=$(basename "$INSTANCE_URL")
-            echo "--- Deploying to $INSTANCE ($ZONE) ---"
-            gcloud compute ssh "$INSTANCE" \
-              --zone="$ZONE" \
-              --project="$PROJECT" \
-              --tunnel-through-iap \
-              --quiet \
-              --command="$DEPLOY_CMD"
-
-            echo "--- Waiting for LB health check ---"
-            sleep 15
-            HTTP=$(curl -sk -o /dev/null -w "%{http_code}" "${{ secrets.VITE_API_BASE_URL }}/health" || echo "000")
-            echo "LB health check: HTTP $HTTP"
-            echo "--- $INSTANCE deployed ---"
-          done <<< "$INSTANCES"
 
           echo "Rolling deploy complete!"

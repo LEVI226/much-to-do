@@ -55,15 +55,9 @@ jobs:
             --max-surge=2 \
             --max-unavailable=0
 
-          echo "=== Waiting for update to complete ==="
-          gcloud compute instance-groups managed wait-until "$MIG" \
-            --version-target-reached \
-            --region="$REGION" \
-            --project="$PROJECT" \
-            --timeout=300
 
           echo "=== Waiting 30s for app startup ==="
-          sleep 30
+          sleep 60
 
           echo "=== Health check ==="
           HTTP=$(curl -sk -o /dev/null -w "%{http_code}" \
